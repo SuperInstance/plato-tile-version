@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-tile-version
+Version: 0.1.0
+Summary: Tile versioning — commit, branch, merge, rollback
+License: MIT
+Requires-Python: >=3.8

@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/plato_tile_version/__init__.py
+src/plato_tile_version/version.py
+src/plato_tile_version.egg-info/PKG-INFO
+src/plato_tile_version.egg-info/SOURCES.txt
+src/plato_tile_version.egg-info/dependency_links.txt
+src/plato_tile_version.egg-info/top_level.txt
