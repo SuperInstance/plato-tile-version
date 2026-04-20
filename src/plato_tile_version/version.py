@@ -1,136 +1,154 @@
-"""Tile versioning — immutable version chains, diff, rollback, branching."""
+"""Tile versioning — immutable version chains, branching, diff, rollback, merge."""
 import time
+import json
 import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
 
 @dataclass
-class TileVersion:
+class Version:
+    number: int
     tile_id: str
-    version: int
     content: str
     author: str = ""
     message: str = ""
-    parent_hash: str = ""
-    hash: str = ""
+    parent: int = 0
     branch: str = "main"
-    created_at: float = field(default_factory=time.time)
+    checksum: str = ""
+    timestamp: float = field(default_factory=time.time)
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        if not self.hash:
-            raw = f"{self.tile_id}:{self.version}:{self.content}:{self.parent_hash}"
-            self.hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        if not self.checksum:
+            self.checksum = hashlib.sha256(
+                f"{self.tile_id}:{self.number}:{self.content}".encode()
+            ).hexdigest()[:16]
 
 @dataclass
-class DiffResult:
-    tile_id: str
+class VersionDiff:
     from_version: int
     to_version: int
-    additions: int
-    deletions: int
-    unchanged: int
-    diff_lines: list[str] = field(default_factory=list)
+    additions: int = 0
+    deletions: int = 0
+    changes: list[str] = field(default_factory=list)
+    is_revert: bool = False
 
-class TileVersionControl:
-    def __init__(self, max_versions: int = 100):
-        self._chains: dict[str, list[TileVersion]] = defaultdict(list)
-        self._branches: dict[str, dict[str, str]] = defaultdict(dict)  # tile_id -> {branch: hash}
-        self.max_versions = max_versions
+@dataclass
+class BranchInfo:
+    name: str
+    head: int
+    created_at: float = field(default_factory=time.time)
+    parent_branch: str = "main"
+
+class TileVersion:
+    def __init__(self):
+        self._versions: dict[str, dict[int, Version]] = defaultdict(dict)  # tile_id → {version → Version}
+        self._branches: dict[str, dict[str, BranchInfo]] = defaultdict(dict)  # tile_id → {branch → BranchInfo}
+        self._heads: dict[str, int] = {}  # tile_id → current version
 
     def commit(self, tile_id: str, content: str, author: str = "",
-               message: str = "", branch: str = "main") -> TileVersion:
-        chain = self._chains[tile_id]
-        parent_hash = chain[-1].hash if chain else ""
-        version = len(chain) + 1
-        tv = TileVersion(tile_id=tile_id, version=version, content=content,
-                        author=author, message=message, parent_hash=parent_hash, branch=branch)
-        chain.append(tv)
-        self._branches[tile_id][branch] = tv.hash
-        # Trim old versions
-        if len(chain) > self.max_versions:
-            self._chains[tile_id] = chain[-self.max_versions:]
-        return tv
+               message: str = "", branch: str = "main") -> Version:
+        tile_versions = self._versions[tile_id]
+        version_num = len(tile_versions) + 1
+        parent = self._heads.get(tile_id, 0)
+        version = Version(number=version_num, tile_id=tile_id, content=content,
+                         author=author, message=message, parent=parent, branch=branch)
+        tile_versions[version_num] = version
+        self._heads[tile_id] = version_num
+        # Update branch head
+        if branch not in self._branches[tile_id]:
+            self._branches[tile_id][branch] = BranchInfo(
+                name=branch, head=version_num, parent_branch=branch)
+        self._branches[tile_id][branch].head = version_num
+        return version
 
-    def checkout(self, tile_id: str, version: int = 0) -> Optional[TileVersion]:
-        chain = self._chains.get(tile_id, [])
-        if not chain:
-            return None
-        if version <= 0:
-            return chain[-1]
-        for tv in chain:
-            if tv.version == version:
-                return tv
-        return None
+    def get(self, tile_id: str, version: int) -> Optional[Version]:
+        return self._versions[tile_id].get(version)
 
-    def head(self, tile_id: str, branch: str = "main") -> Optional[TileVersion]:
-        chain = self._chains.get(tile_id, [])
-        for tv in reversed(chain):
-            if tv.branch == branch:
-                return tv
-        return chain[-1] if chain else None
+    def head(self, tile_id: str) -> Optional[Version]:
+        v = self._heads.get(tile_id)
+        return self._versions[tile_id].get(v) if v else None
 
-    def history(self, tile_id: str, limit: int = 20) -> list[TileVersion]:
-        chain = self._chains.get(tile_id, [])
-        return list(reversed(chain[-limit:]))
+    def history(self, tile_id: str, limit: int = 50) -> list[Version]:
+        versions = list(self._versions[tile_id].values())
+        versions.sort(key=lambda v: v.number, reverse=True)
+        return versions[:limit]
 
-    def diff(self, tile_id: str, from_v: int, to_v: int) -> DiffResult:
-        old = self.checkout(tile_id, from_v)
-        new = self.checkout(tile_id, to_v)
-        if not old or not new:
-            return DiffResult(tile_id=tile_id, from_version=from_v, to_version=to_v,
-                            additions=0, deletions=0, unchanged=0)
-        old_lines = old.content.splitlines()
-        new_lines = new.content.splitlines()
-        old_set = set(old_lines)
-        new_set = set(new_lines)
-        additions = len(new_set - old_set)
-        deletions = len(old_set - new_set)
-        unchanged = len(old_set & new_set)
-        diff_lines = []
-        for line in new_lines:
-            if line not in old_set:
-                diff_lines.append(f"+ {line}")
-        for line in old_lines:
-            if line not in new_set:
-                diff_lines.append(f"- {line}")
-        return DiffResult(tile_id=tile_id, from_version=from_v, to_version=to_v,
-                         additions=additions, deletions=deletions, unchanged=unchanged,
-                         diff_lines=diff_lines)
+    def diff(self, tile_id: str, from_v: int, to_v: int) -> VersionDiff:
+        v_from = self._versions[tile_id].get(from_v)
+        v_to = self._versions[tile_id].get(to_v)
+        if not v_from or not v_to:
+            return VersionDiff(from_version=from_v, to_version=to_v)
+        # Line-level diff
+        lines_from = v_from.content.splitlines()
+        lines_to = v_to.content.splitlines()
+        set_from = set(lines_from)
+        set_to = set(lines_to)
+        additions = len(set_to - set_from)
+        deletions = len(set_from - set_to)
+        changes = []
+        for line in sorted(set_to - set_from):
+            changes.append(f"+ {line}")
+        for line in sorted(set_from - set_to):
+            changes.append(f"- {line}")
+        # Check if this is a revert
+        is_revert = v_to.content == self._versions[tile_id].get(v_from.parent, Version(0, "", "")).content if v_from.parent else False
+        return VersionDiff(from_version=from_v, to_version=to_v,
+                          additions=additions, deletions=deletions,
+                          changes=changes[:50], is_revert=is_revert)
 
-    def rollback(self, tile_id: str, version: int, author: str = "",
-                 message: str = "") -> Optional[TileVersion]:
-        target = self.checkout(tile_id, version)
+    def rollback(self, tile_id: str, to_version: int, author: str = "") -> Optional[Version]:
+        target = self._versions[tile_id].get(to_version)
         if not target:
             return None
-        return self.commit(tile_id, target.content, author=author,
-                          message=message or f"Rollback to v{version}")
+        return self.commit(tile_id, target.content, author,
+                          f"Rollback to v{to_version}")
 
-    def branch(self, tile_id: str, branch_name: str, from_version: int = 0) -> bool:
-        target = self.checkout(tile_id, from_version)
-        if not target:
-            return False
-        self._branches[tile_id][branch_name] = target.hash
-        return True
-
-    def branches(self, tile_id: str) -> dict[str, str]:
-        return dict(self._branches.get(tile_id, {}))
+    def branch(self, tile_id: str, branch_name: str, from_branch: str = "main") -> Optional[BranchInfo]:
+        from_head = self._branches[tile_id].get(from_branch)
+        if not from_head:
+            return None
+        info = BranchInfo(name=branch_name, head=from_head.head,
+                         parent_branch=from_branch)
+        self._branches[tile_id][branch_name] = info
+        return info
 
     def merge(self, tile_id: str, source_branch: str, target_branch: str = "main",
-              author: str = "") -> Optional[TileVersion]:
-        source = self.head(tile_id, source_branch)
-        target = self.head(tile_id, target_branch)
-        if not source:
+              author: str = "") -> Optional[Version]:
+        source = self._branches[tile_id].get(source_branch)
+        target = self._branches[tile_id].get(target_branch)
+        if not source or not target:
             return None
-        return self.commit(tile_id, source.content, author=author,
-                          message=f"Merge {source_branch} into {target_branch}",
+        source_content = self._versions[tile_id].get(source.head)
+        if not source_content:
+            return None
+        return self.commit(tile_id, source_content.content, author,
+                          f"Merge {source_branch} into {target_branch}",
                           branch=target_branch)
 
-    def stats(self, tile_id: str = "") -> dict:
-        if tile_id:
-            chain = self._chains.get(tile_id, [])
-            return {"tile_id": tile_id, "versions": len(chain),
-                    "branches": len(self._branches.get(tile_id, {}))}
-        return {"tiles": len(self._chains),
-                "total_versions": sum(len(c) for c in self._chains.values())}
+    def branches(self, tile_id: str) -> list[BranchInfo]:
+        return list(self._branches[tile_id].values())
+
+    def version_count(self, tile_id: str) -> int:
+        return len(self._versions[tile_id])
+
+    def all_tile_ids(self) -> list[str]:
+        return list(self._versions.keys())
+
+    def export(self, tile_id: str) -> dict:
+        versions = self.history(tile_id, limit=1000)
+        return {"tile_id": tile_id, "versions": [
+            {"number": v.number, "author": v.author, "message": v.message,
+             "branch": v.branch, "checksum": v.checksum, "timestamp": v.timestamp,
+             "content_length": len(v.content)}
+            for v in versions
+        ], "branches": [{"name": b.name, "head": b.head, "parent": b.parent_branch}
+                        for b in self.branches(tile_id)]}
+
+    @property
+    def stats(self) -> dict:
+        tiles = len(self._versions)
+        versions = sum(len(vs) for vs in self._versions.values())
+        branches = sum(len(bs) for bs in self._branches.values())
+        return {"tiles": tiles, "versions": versions, "branches": branches}
